@@ -214,19 +214,19 @@ void TaskAutoSequence(void *pvParameters) {
           Serial.println("Auto Sequence: Isi Bak");
           isibak();
           xSemaphoreGive(relayMutex);
-          vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk isi bak
+          vTaskDelay(10 * 60 * 1000 / portTICK_PERIOD_MS); // 10 menit untuk isi bak
           
           if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
             Serial.println("Auto Sequence: Mixing");
             mixing();
             xSemaphoreGive(relayMutex);
-            vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk mixing
+            vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS); // 5 menit untuk mixing
             
             if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
               Serial.println("Auto Sequence: Supply");
               supply();
               xSemaphoreGive(relayMutex);
-              vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk supply
+              vTaskDelay(30 * 60 * 1000 / portTICK_PERIOD_MS); // 30 menit untuk supply
               
               if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
                 Serial.println("Auto Sequence: Off");
@@ -373,13 +373,37 @@ const char* getModeName(OperationMode mode) {
 
 // Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
 bool isScheduledTime() {
+  static bool sequenceStarted = false;
+  static unsigned long lastCheckTime = 0;
+  
+  // Hanya periksa setiap menit untuk menghemat sumber daya
+  if (millis() - lastCheckTime < 60000) {
+    return sequenceStarted;
+  }
+  
+  lastCheckTime = millis();
   DateTime now = rtc.now();
   int currentHour = now.hour();
   int currentMinute = now.minute();
   
-  // Jam 7 pagi (7:00 - 7:05) atau jam 4 sore (16:00 - 16:05)
-  return (currentHour == 7 && currentMinute < 5) || 
-         (currentHour == 16 && currentMinute < 5);
+  // Jam 7 pagi (7:00) atau jam 4 sore (16:00) tepat
+  bool isScheduledHour = (currentHour == 7 && currentMinute == 0) || 
+                         (currentHour == 16 && currentMinute == 0);
+  
+  // Jika waktu terjadwal dan sekuens belum dimulai, mulai sekuens
+  if (isScheduledHour && !sequenceStarted) {
+    sequenceStarted = true;
+    return true;
+  }
+  
+  // Jika sekuens sudah dimulai, reset flag setelah 1 menit
+  // untuk mencegah sekuens berjalan berulang kali dalam satu jam
+  if (sequenceStarted && ((currentHour == 7 && currentMinute > 0) || 
+                          (currentHour == 16 && currentMinute > 0))) {
+    sequenceStarted = false;
+  }
+  
+  return false;
 }
 
 // Fungsi relay yang sudah ada
