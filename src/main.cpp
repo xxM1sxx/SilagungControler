@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <WiFiManager.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -14,6 +16,14 @@
 #define RELAY4 42
 #define RELAY5 45
 #define RELAY6 46
+
+// Tentukan pin I2C secara eksplisit (sesuaikan dengan pin yang Anda gunakan)
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+// Inisialisasi objek RTC
+RTC_DS3231 rtc;
+char daysOfTheWeek[7][12] = {"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"};
 
 // Mode operasi
 enum OperationMode {
@@ -35,6 +45,7 @@ void TaskLocalOperation(void *pvParameters);
 void TaskAutoSequence(void *pvParameters);
 void TaskWiFiSetup(void *pvParameters);
 void TaskSerialCommand(void *pvParameters);
+void TaskRTCMonitor(void *pvParameters);
 
 // Fungsi relay
 void isibak();
@@ -43,6 +54,16 @@ void supply();
 void relayoff();
 void setOperationMode(OperationMode mode);
 const char* getModeName(OperationMode mode);
+bool isScheduledTime();
+
+// Format waktu menjadi string
+String formatDateTime(const DateTime &dt) {
+  char buffer[25];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          dt.year(), dt.month(), dt.day(),
+          dt.hour(), dt.minute(), dt.second());
+  return String(buffer);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -61,6 +82,30 @@ void setup() {
 
   // Matikan semua relay pada awalnya
   relayoff();
+
+  // Inisialisasi I2C dan RTC
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Cek apakah RTC terdeteksi
+  if (!rtc.begin()) {
+    Serial.println("Tidak dapat menemukan RTC DS3231!");
+    Serial.println("Periksa koneksi kabel dan pastikan baterai terpasang");
+  } else {
+    // Cek apakah RTC kehilangan daya dan perlu diatur ulang
+    if (rtc.lostPower()) {
+      Serial.println("RTC kehilangan daya, mengatur waktu ke waktu kompilasi!");
+      // Atur RTC ke waktu kompilasi
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    
+    // Tampilkan waktu saat ini
+    DateTime now = rtc.now();
+    Serial.print("Waktu saat ini: ");
+    Serial.println(formatDateTime(now));
+    Serial.print("Hari: ");
+    Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+    
+  }
 
   // Buat task
   xTaskCreate(
@@ -99,6 +144,16 @@ void setup() {
     1,                     // Prioritas
     NULL                   // Task handle
   );
+  
+  // Tambahkan task untuk monitoring RTC
+  xTaskCreate(
+    TaskRTCMonitor,        // Fungsi task
+    "RTCMonitor",          // Nama task
+    2048,                  // Stack size
+    NULL,                  // Parameter
+    1,                     // Prioritas
+    NULL                   // Task handle
+  );
 }
 
 void loop() {
@@ -118,19 +173,15 @@ void TaskLocalOperation(void *pvParameters) {
         switch (currentMode) {
           case MODE_ISIBAK:
             isibak();
-            Serial.println("Mode: Isi Bak");
             break;
           case MODE_MIXING:
             mixing();
-            Serial.println("Mode: Mixing");
             break;
           case MODE_SUPPLY:
             supply();
-            Serial.println("Mode: Supply");
             break;
           case MODE_OFF:
             relayoff();
-            Serial.println("Mode: Off");
             break;
           default:
             break;
@@ -153,31 +204,35 @@ void TaskAutoSequence(void *pvParameters) {
   for (;;) {
     // Hanya jalankan jika dalam mode AUTO
     if (currentMode == MODE_AUTO) {
-      // Ambil mutex sebelum mengakses relay
-      if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-        // Jalankan sekuens
-        Serial.println("Auto Sequence: Isi Bak");
-        isibak();
-        xSemaphoreGive(relayMutex);
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+      // Cek apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
+      if (isScheduledTime()) {
+        Serial.println("Waktu terjadwal terdeteksi, memulai sekuens otomatis");
         
+        // Ambil mutex sebelum mengakses relay
         if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-          Serial.println("Auto Sequence: Mixing");
-          mixing();
+          // Jalankan sekuens
+          Serial.println("Auto Sequence: Isi Bak");
+          isibak();
           xSemaphoreGive(relayMutex);
-          vTaskDelay(2000 / portTICK_PERIOD_MS);
+          vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk isi bak
           
           if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-            Serial.println("Auto Sequence: Supply");
-            supply();
+            Serial.println("Auto Sequence: Mixing");
+            mixing();
             xSemaphoreGive(relayMutex);
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk mixing
             
             if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-              Serial.println("Auto Sequence: Off");
-              relayoff();
+              Serial.println("Auto Sequence: Supply");
+              supply();
               xSemaphoreGive(relayMutex);
-              vTaskDelay(2000 / portTICK_PERIOD_MS);
+              vTaskDelay(10000 / portTICK_PERIOD_MS); // 10 detik untuk supply
+              
+              if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
+                Serial.println("Auto Sequence: Off");
+                relayoff();
+                xSemaphoreGive(relayMutex);
+              }
             }
           }
         }
@@ -207,7 +262,7 @@ void TaskWiFiSetup(void *pvParameters) {
   vTaskDelete(NULL);
 }
 
-// Tambahkan task baru untuk membaca perintah serial
+// Task untuk membaca perintah serial
 void TaskSerialCommand(void *pvParameters) {
   (void) pvParameters;
   
@@ -232,8 +287,24 @@ void TaskSerialCommand(void *pvParameters) {
         setOperationMode(MODE_AUTO);
       } 
       else if (command.equalsIgnoreCase("status")) {
+        DateTime now = rtc.now();
         Serial.print("Current mode: ");
         Serial.println(getModeName(currentMode));
+        Serial.print("Waktu: ");
+        Serial.println(formatDateTime(now));
+        Serial.print("Hari: ");
+        Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+      }
+      else if (command.startsWith("settime")) {
+        // Format: settime YYYY MM DD HH MM SS
+        // Contoh: settime 2023 11 15 14 30 00
+        int year, month, day, hour, minute, second;
+        if (sscanf(command.c_str(), "settime %d %d %d %d %d %d", &year, &month, &day, &hour, &minute, &second) == 6) {
+          rtc.adjust(DateTime(year, month, day, hour, minute, second));
+          Serial.println("Waktu RTC telah diatur ulang!");
+        } else {
+          Serial.println("Format tidak valid. Gunakan: settime YYYY MM DD HH MM SS");
+        }
       }
       else if (command.equalsIgnoreCase("disconnect")) {
         WiFi.disconnect(true);
@@ -241,11 +312,37 @@ void TaskSerialCommand(void *pvParameters) {
         ESP.restart();
       }
       else {
-        Serial.println("Unknown command. Available commands: isibak, mixing, supply, off, auto, status");
+        Serial.println("Unknown command. Available commands: isibak, mixing, supply, off, auto, status, settime, disconnect");
       }
     }
     
     vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// Task untuk monitoring RTC
+void TaskRTCMonitor(void *pvParameters) {
+  (void) pvParameters;
+  TickType_t xLastWakeTime;
+  const TickType_t xFrequency = 5000 / portTICK_PERIOD_MS; // 5 detik
+  
+  // Inisialisasi xLastWakeTime dengan waktu saat ini
+  xLastWakeTime = xTaskGetTickCount();
+  
+  for (;;) {
+    // Tunggu untuk interval yang tepat
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    
+    // Ambil waktu saat ini dari RTC
+    DateTime now = rtc.now();
+    
+    // Tampilkan informasi waktu
+    Serial.print("Waktu: ");
+    Serial.println(formatDateTime(now));
+    Serial.print("Hari: ");
+    Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+    Serial.print("Mode saat ini: ");
+    Serial.println(getModeName(currentMode));
   }
 }
 
@@ -272,6 +369,17 @@ const char* getModeName(OperationMode mode) {
     default:
       return "Unknown";
   }
+}
+
+// Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
+bool isScheduledTime() {
+  DateTime now = rtc.now();
+  int currentHour = now.hour();
+  int currentMinute = now.minute();
+  
+  // Jam 7 pagi (7:00 - 7:05) atau jam 4 sore (16:00 - 16:05)
+  return (currentHour == 7 && currentMinute < 5) || 
+         (currentHour == 16 && currentMinute < 5);
 }
 
 // Fungsi relay yang sudah ada
