@@ -4,12 +4,18 @@
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <Firebase_ESP_Client.h>
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+// Firebase
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// Definisi pin relay
 #define RELAY1 1
 #define RELAY2 2
 #define RELAY3 41
@@ -17,9 +23,19 @@
 #define RELAY5 45
 #define RELAY6 46
 
-// Tentukan pin I2C secara eksplisit (sesuaikan dengan pin yang Anda gunakan)
+// Tentukan pin I2C secara eksplisit
 #define SDA_PIN 8
 #define SCL_PIN 9
+
+// Firebase credentials
+#define API_KEY "AIzaSyASs8IMEdH5s-ne-W7zVQ7nY4Bl9VbQgEE"
+#define DATABASE_URL "https://silagung-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// Inisialisasi objek Firebase
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
 
 // Inisialisasi objek RTC
 RTC_DS3231 rtc;
@@ -31,21 +47,26 @@ enum OperationMode {
   MODE_MIXING,
   MODE_SUPPLY,
   MODE_OFF,
-  MODE_AUTO  // Mode otomatis untuk menjalankan semua secara berurutan
+  MODE_AUTO
 };
 
 // Variabel untuk mode operasi saat ini
 OperationMode currentMode = MODE_OFF;
 
-// Mutex untuk akses ke relay
+// Variabel global untuk menyimpan mode yang akan diupdate ke Firebase
+OperationMode pendingModeUpdate = MODE_OFF;
+bool modeUpdatePending = false;
+
+// Mutex untuk akses ke relay dan Firebase
 SemaphoreHandle_t relayMutex;
+SemaphoreHandle_t firebaseMutex;
 
 // Deklarasi task
 void TaskLocalOperation(void *pvParameters);
 void TaskAutoSequence(void *pvParameters);
 void TaskWiFiSetup(void *pvParameters);
-void TaskSerialCommand(void *pvParameters);
 void TaskRTCMonitor(void *pvParameters);
+void TaskFirebaseMonitor(void *pvParameters);
 
 // Fungsi relay
 void isibak();
@@ -55,6 +76,8 @@ void relayoff();
 void setOperationMode(OperationMode mode);
 const char* getModeName(OperationMode mode);
 bool isScheduledTime();
+void updateFirebaseStatus();
+void printStatus();
 
 // Format waktu menjadi string
 String formatDateTime(const DateTime &dt) {
@@ -71,6 +94,7 @@ void setup() {
 
   // Inisialisasi mutex
   relayMutex = xSemaphoreCreateMutex();
+  firebaseMutex = xSemaphoreCreateMutex();
 
   // Inisialisasi pin relay
   pinMode(RELAY1, OUTPUT);  
@@ -83,82 +107,86 @@ void setup() {
   // Matikan semua relay pada awalnya
   relayoff();
 
-  // Inisialisasi I2C dan RTC
+  // Inisialisasi I2C dengan pin yang ditentukan
   Wire.begin(SDA_PIN, SCL_PIN);
-  
-  // Cek apakah RTC terdeteksi
+
+  // Inisialisasi RTC
   if (!rtc.begin()) {
-    Serial.println("Tidak dapat menemukan RTC DS3231!");
-    Serial.println("Periksa koneksi kabel dan pastikan baterai terpasang");
-  } else {
-    // Cek apakah RTC kehilangan daya dan perlu diatur ulang
-    if (rtc.lostPower()) {
-      Serial.println("RTC kehilangan daya, mengatur waktu ke waktu kompilasi!");
-      // Atur RTC ke waktu kompilasi
-      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    }
-    
-    // Tampilkan waktu saat ini
-    DateTime now = rtc.now();
-    Serial.print("Waktu saat ini: ");
-    Serial.println(formatDateTime(now));
-    Serial.print("Hari: ");
-    Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
-    
+    Serial.println("Couldn't find RTC");
+    while (1);
   }
 
-  // Buat task
+  // Cek apakah RTC kehilangan daya
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting default time!");
+    // Atur waktu default jika RTC kehilangan daya
+    rtc.adjust(DateTime(2024, 1, 1, 0, 0, 0));
+  }
+
+  // Tampilkan waktu saat ini
+  DateTime now = rtc.now();
+  Serial.print("Waktu saat ini: ");
+  Serial.println(formatDateTime(now));
+  Serial.print("Hari: ");
+  Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+  Serial.print("Suhu: ");
+  Serial.print(rtc.getTemperature());
+  Serial.println(" C");
+
+  // Buat task untuk operasi lokal
   xTaskCreate(
-    TaskLocalOperation,    // Fungsi task
-    "LocalOperation",      // Nama task
-    4096,                  // Stack size
-    NULL,                  // Parameter
-    1,                     // Prioritas
-    NULL                   // Task handle
+    TaskLocalOperation,     // Fungsi task
+    "LocalOperation",       // Nama task
+    2048,                   // Stack size
+    NULL,                   // Parameter
+    1,                      // Prioritas
+    NULL                    // Task handle
   );
 
+  // Buat task untuk sekuens otomatis
   xTaskCreate(
-    TaskAutoSequence,      // Fungsi task
-    "AutoSequence",        // Nama task
-    2048,                  // Stack size
-    NULL,                  // Parameter
-    1,                     // Prioritas
-    NULL                   // Task handle
+    TaskAutoSequence,       // Fungsi task
+    "AutoSequence",         // Nama task
+    2048,                   // Stack size
+    NULL,                   // Parameter
+    1,                      // Prioritas
+    NULL                    // Task handle
   );
 
+  // Buat task untuk setup WiFi
   xTaskCreate(
-    TaskWiFiSetup,         // Fungsi task
-    "WiFiSetup",           // Nama task
-    4096,                  // Stack size
-    NULL,                  // Parameter
-    2,                     // Prioritas (lebih tinggi untuk setup WiFi)
-    NULL                   // Task handle
+    TaskWiFiSetup,          // Fungsi task
+    "WiFiSetup",            // Nama task
+    8192,                   // Stack size (ditingkatkan)
+    NULL,                   // Parameter
+    2,                      // Prioritas (lebih tinggi untuk setup WiFi)
+    NULL                    // Task handle
   );
 
-  // Tambahkan task untuk membaca perintah serial
+  // Buat task untuk monitoring RTC
   xTaskCreate(
-    TaskSerialCommand,     // Fungsi task
-    "SerialCommand",       // Nama task
-    2048,                  // Stack size
-    NULL,                  // Parameter
-    1,                     // Prioritas
-    NULL                   // Task handle
+    TaskRTCMonitor,         // Fungsi task
+    "RTCMonitor",           // Nama task
+    2048,                   // Stack size
+    NULL,                   // Parameter
+    1,                      // Prioritas
+    NULL                    // Task handle
   );
   
-  // Tambahkan task untuk monitoring RTC
+  // Tambahkan task untuk monitoring Firebase dengan stack size yang lebih besar
   xTaskCreate(
-    TaskRTCMonitor,        // Fungsi task
-    "RTCMonitor",          // Nama task
-    2048,                  // Stack size
-    NULL,                  // Parameter
-    1,                     // Prioritas
-    NULL                   // Task handle
+    TaskFirebaseMonitor,    // Fungsi task
+    "FirebaseMonitor",      // Nama task
+    16384,                  // Stack size (lebih besar untuk Firebase)
+    NULL,                   // Parameter
+    1,                      // Prioritas
+    NULL                    // Task handle
   );
 }
 
 void loop() {
-  // Kosong karena kita menggunakan FreeRTOS tasks
-  vTaskDelay(1000 / portTICK_PERIOD_MS); // Beri waktu untuk task lain
+  // Tidak ada yang perlu dilakukan di sini karena semua operasi ditangani oleh task
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
 
 // Task untuk operasi lokal (akan berjalan bahkan saat offline)
@@ -244,116 +272,308 @@ void TaskAutoSequence(void *pvParameters) {
   }
 }
 
-// Task untuk setup WiFi
+// Task untuk setup WiFi dan Firebase
 void TaskWiFiSetup(void *pvParameters) {
   (void) pvParameters;
   
-  // Setup WiFi
+  // Inisialisasi WiFiManager
   WiFiManager wm;
+  
+  // Atur timeout
+  wm.setConfigPortalTimeout(180);
+  
+  // Atur nama AP dan password
   bool res = wm.autoConnect("Silagung", "admin123");
   
   if (res) {
     Serial.println("WiFi connected successfully");
-  } else {
-    Serial.println("Failed to connect to WiFi, operating in offline mode");
-  }
-  
-  // Task ini hanya perlu dijalankan sekali untuk setup WiFi
-  vTaskDelete(NULL);
-}
-
-// Task untuk membaca perintah serial
-void TaskSerialCommand(void *pvParameters) {
-  (void) pvParameters;
-  
-  for (;;) {
-    if (Serial.available() > 0) {
-      String command = Serial.readStringUntil('\n');
-      command.trim();
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    
+    // Tunggu sebentar sebelum inisialisasi Firebase
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    
+    // Inisialisasi Firebase dengan stack yang cukup
+    if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
+      Serial.println("Initializing Firebase...");
       
-      if (command.equalsIgnoreCase("isibak")) {
-        setOperationMode(MODE_ISIBAK);
-      } 
-      else if (command.equalsIgnoreCase("mixing")) {
-        setOperationMode(MODE_MIXING);
-      } 
-      else if (command.equalsIgnoreCase("supply")) {
-        setOperationMode(MODE_SUPPLY);
-      } 
-      else if (command.equalsIgnoreCase("off")) {
-        setOperationMode(MODE_OFF);
-      } 
-      else if (command.equalsIgnoreCase("auto")) {
-        setOperationMode(MODE_AUTO);
-      } 
-      else if (command.equalsIgnoreCase("status")) {
-        DateTime now = rtc.now();
-        Serial.print("Current mode: ");
-        Serial.println(getModeName(currentMode));
-        Serial.print("Waktu: ");
-        Serial.println(formatDateTime(now));
-        Serial.print("Hari: ");
-        Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
-      }
-      else if (command.startsWith("settime")) {
-        // Format: settime YYYY MM DD HH MM SS
-        // Contoh: settime 2023 11 15 14 30 00
-        int year, month, day, hour, minute, second;
-        if (sscanf(command.c_str(), "settime %d %d %d %d %d %d", &year, &month, &day, &hour, &minute, &second) == 6) {
-          rtc.adjust(DateTime(year, month, day, hour, minute, second));
-          Serial.println("Waktu RTC telah diatur ulang!");
-        } else {
-          Serial.println("Format tidak valid. Gunakan: settime YYYY MM DD HH MM SS");
+      // Konfigurasi Firebase
+      config.api_key = API_KEY;
+      config.database_url = DATABASE_URL;
+      
+      Serial.println("Firebase API Key: " + String(API_KEY));
+      Serial.println("Firebase Database URL: " + String(DATABASE_URL));
+      
+      // Autentikasi anonim
+      Serial.println("Attempting Firebase signup...");
+      if (Firebase.signUp(&config, &auth, "", "")) {
+        Serial.println("Firebase signup OK");
+        signupOK = true;
+      } else {
+        Serial.println("Firebase signup failed");
+        if (config.signer.signupError.message.length() > 0) {
+          Serial.print("Reason: ");
+          Serial.println(config.signer.signupError.message.c_str());
         }
       }
-      else if (command.equalsIgnoreCase("disconnect")) {
-        WiFi.disconnect(true);
-        Serial.println("WiFi disconnected. Please reconnect to configure new network.");
-        ESP.restart();
-      }
-      else {
-        Serial.println("Unknown command. Available commands: isibak, mixing, supply, off, auto, status, settime, disconnect");
-      }
+      
+      // Callback untuk token
+      config.token_status_callback = tokenStatusCallback;
+      
+      // Mulai koneksi Firebase
+      Serial.println("Starting Firebase connection...");
+      Firebase.begin(&config, &auth);
+      Firebase.reconnectWiFi(true);
+      
+      Serial.println("Firebase setup complete");
+      xSemaphoreGive(firebaseMutex);
     }
-    
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+  } else {
+    Serial.println("WiFi connection failed");
   }
+  
+  // Task selesai, hapus diri sendiri
+  vTaskDelete(NULL);
 }
 
 // Task untuk monitoring RTC
 void TaskRTCMonitor(void *pvParameters) {
   (void) pvParameters;
-  TickType_t xLastWakeTime;
-  const TickType_t xFrequency = 5000 / portTICK_PERIOD_MS; // 5 detik
-  
-  // Inisialisasi xLastWakeTime dengan waktu saat ini
-  xLastWakeTime = xTaskGetTickCount();
   
   for (;;) {
-    // Tunggu untuk interval yang tepat
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    
-    // Ambil waktu saat ini dari RTC
+    // Tampilkan waktu setiap menit
+    static int lastMinute = -1;
     DateTime now = rtc.now();
     
-    // Tampilkan informasi waktu
-    Serial.print("Waktu: ");
-    Serial.println(formatDateTime(now));
-    Serial.print("Hari: ");
-    Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
-    Serial.print("Mode saat ini: ");
-    Serial.println(getModeName(currentMode));
+    if (now.minute() != lastMinute) {
+      lastMinute = now.minute();
+      
+      // Tampilkan waktu saat ini
+      Serial.print("Waktu: ");
+      Serial.println(formatDateTime(now));
+      Serial.print("Hari: ");
+      Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+      Serial.print("Suhu: ");
+      Serial.print(rtc.getTemperature());
+      Serial.println(" C");
+      Serial.print("Mode saat ini: ");
+      Serial.println(getModeName(currentMode));
+    }
+    
+    // Delay sebelum iterasi berikutnya
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
-// Fungsi untuk mengubah mode operasi
-void setOperationMode(OperationMode mode) {
-  currentMode = mode;
-  Serial.print("Mode changed to: ");
-  Serial.println(getModeName(mode));
+// Task untuk monitoring Firebase
+void TaskFirebaseMonitor(void *pvParameters) {
+  (void) pvParameters;
+  
+  // Tunggu sampai WiFi dan Firebase siap
+  vTaskDelay(10000 / portTICK_PERIOD_MS);
+  
+  Serial.println("Starting Firebase monitor task");
+  
+  for (;;) {
+    // Hanya jalankan jika WiFi terhubung dan Firebase siap
+    if (WiFi.status() == WL_CONNECTED && signupOK) {
+      // Periksa apakah ada update mode yang pending
+      if (modeUpdatePending) {
+        if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
+          String modeStr;
+          switch (pendingModeUpdate) {
+            case MODE_ISIBAK: modeStr = "isibak"; break;
+            case MODE_MIXING: modeStr = "mixing"; break;
+            case MODE_SUPPLY: modeStr = "supply"; break;
+            case MODE_OFF: modeStr = "off"; break;
+            case MODE_AUTO: modeStr = "auto"; break;
+            default: modeStr = "unknown"; break;
+          }
+          
+          Serial.print("Updating Firebase mode to: ");
+          Serial.println(modeStr);
+          
+          if (Firebase.RTDB.setString(&fbdo, "silagung-controller/mode/current", modeStr)) {
+            Serial.println("Mode update successful");
+          } else {
+            Serial.print("Mode update failed: ");
+            Serial.println(fbdo.errorReason());
+          }
+          
+          modeUpdatePending = false;
+          xSemaphoreGive(firebaseMutex);
+        }
+      }
+      
+      // Cek perintah dari Firebase
+      if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
+        if (Firebase.RTDB.getString(&fbdo, "silagung-controller/commands/setMode")) {
+          String command = fbdo.stringData();
+          
+          if (command.length() > 0) {
+            Serial.print("Menerima perintah: ");
+            Serial.println(command);
+            
+            // Eksekusi perintah
+            if (command == "isibak") {
+              setOperationMode(MODE_ISIBAK);
+            } else if (command == "mixing") {
+              setOperationMode(MODE_MIXING);
+            } else if (command == "supply") {
+              setOperationMode(MODE_SUPPLY);
+            } else if (command == "off") {
+              setOperationMode(MODE_OFF);
+            } else if (command == "auto") {
+              setOperationMode(MODE_AUTO);
+            }
+            
+            // Reset perintah
+            Firebase.RTDB.setString(&fbdo, "silagung-controller/commands/setMode", "");
+          }
+        }
+        
+        xSemaphoreGive(firebaseMutex);
+      }
+      
+      // Update status ke Firebase setiap 30 detik
+      static unsigned long lastUpdateTime = 0;
+      if (millis() - lastUpdateTime > 30000) {
+        updateFirebaseStatus();
+        lastUpdateTime = millis();
+      }
+    }
+    
+    // Delay sebelum iterasi berikutnya
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
 }
 
-// Mendapatkan nama mode sebagai string
+// Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
+bool isScheduledTime() {
+  static bool sequenceStarted = false;
+  static unsigned long lastCheckTime = 0;
+  
+  // Periksa lebih sering (setiap 100ms) untuk menangkap waktu dengan lebih tepat
+  if (millis() - lastCheckTime < 100) {
+    return sequenceStarted;
+  }
+  
+  lastCheckTime = millis();
+  DateTime now = rtc.now();
+  int currentHour = now.hour();
+  int currentMinute = now.minute();
+  int currentSecond = now.second();
+  
+  // Debug output untuk melihat waktu yang tepat
+  if (currentHour == 7 && currentMinute == 0) {
+    Serial.print("Deteksi waktu terjadwal: ");
+    Serial.print(currentHour);
+    Serial.print(":");
+    Serial.print(currentMinute);
+    Serial.print(":");
+    Serial.println(currentSecond);
+  }
+  
+  // Jam 7 pagi (7:00:xx) atau jam 4 sore (16:00:xx) dalam 60 detik pertama
+  bool isScheduledHour = (currentHour == 7 && currentMinute == 0) || 
+                         (currentHour == 16 && currentMinute == 0);
+  
+  // Jika waktu terjadwal dan sekuens belum dimulai, mulai sekuens
+  if (isScheduledHour && !sequenceStarted) {
+    Serial.println("Waktu terjadwal terdeteksi, memulai sekuens otomatis");
+    sequenceStarted = true;
+    return true;
+  }
+  
+  // Jika sekuens sudah dimulai, reset flag setelah 1 menit
+  // untuk mencegah sekuens berjalan berulang kali dalam satu jam
+  if (sequenceStarted && ((currentHour == 7 && currentMinute > 0) || 
+                          (currentHour == 16 && currentMinute > 0))) {
+    sequenceStarted = false;
+  }
+  
+  return sequenceStarted;
+}
+
+// Fungsi untuk update status ke Firebase
+void updateFirebaseStatus() {
+  if (WiFi.status() == WL_CONNECTED && signupOK) {
+    if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
+      DateTime now = rtc.now();
+      bool updateSuccess = true;
+      
+      // Update waktu
+      if (Firebase.RTDB.setString(&fbdo, "silagung-controller/status/time", formatDateTime(now))) {
+        Serial.println("Time update successful");
+      } else {
+        Serial.print("Time update failed: ");
+        Serial.println(fbdo.errorReason());
+        updateSuccess = false;
+      }
+      
+      // Jika update pertama gagal, jangan lanjutkan
+      if (updateSuccess) {
+        // Update hari
+        if (Firebase.RTDB.setString(&fbdo, "silagung-controller/status/day", daysOfTheWeek[now.dayOfTheWeek()])) {
+          Serial.println("Day update successful");
+        } else {
+          Serial.print("Day update failed: ");
+          Serial.println(fbdo.errorReason());
+        }
+        
+        // Update suhu
+        if (Firebase.RTDB.setFloat(&fbdo, "silagung-controller/status/temperature", rtc.getTemperature())) {
+          Serial.println("Temperature update successful");
+        } else {
+          Serial.print("Temperature update failed: ");
+          Serial.println(fbdo.errorReason());
+        }
+        
+        // Update mode
+        if (Firebase.RTDB.setString(&fbdo, "silagung-controller/status/currentMode", getModeName(currentMode))) {
+          Serial.println("Mode update successful");
+        } else {
+          Serial.print("Mode update failed: ");
+          Serial.println(fbdo.errorReason());
+        }
+        
+        // Update timestamp
+        if (Firebase.RTDB.setInt(&fbdo, "silagung-controller/status/lastUpdate", now.unixtime())) {
+          Serial.println("Timestamp update successful");
+        } else {
+          Serial.print("Timestamp update failed: ");
+          Serial.println(fbdo.errorReason());
+        }
+      }
+      
+      xSemaphoreGive(firebaseMutex);
+    }
+  }
+}
+
+// Fungsi untuk mengubah mode operasi - dioptimalkan untuk mengurangi penggunaan stack
+void setOperationMode(OperationMode mode) {
+  // Simpan mode baru
+  currentMode = mode;
+  
+  // Log perubahan mode
+  Serial.print("Mode changed to: ");
+  Serial.println(getModeName(mode));
+  
+  // Jika beralih ke mode AUTO dan bukan waktu terjadwal, matikan semua relay
+  if (mode == MODE_AUTO && !isScheduledTime()) {
+    if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
+      relayoff();
+      xSemaphoreGive(relayMutex);
+    }
+  }
+  
+  // Tandai bahwa ada update mode yang pending untuk Firebase
+  pendingModeUpdate = mode;
+  modeUpdatePending = true;
+}
+
+// Fungsi untuk mendapatkan nama mode
 const char* getModeName(OperationMode mode) {
   switch (mode) {
     case MODE_ISIBAK:
@@ -371,39 +591,18 @@ const char* getModeName(OperationMode mode) {
   }
 }
 
-// Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
-bool isScheduledTime() {
-  static bool sequenceStarted = false;
-  static unsigned long lastCheckTime = 0;
-  
-  // Hanya periksa setiap menit untuk menghemat sumber daya
-  if (millis() - lastCheckTime < 60000) {
-    return sequenceStarted;
-  }
-  
-  lastCheckTime = millis();
+// Fungsi terpisah untuk menampilkan status - mengurangi penggunaan stack
+void printStatus() {
   DateTime now = rtc.now();
-  int currentHour = now.hour();
-  int currentMinute = now.minute();
-  
-  // Jam 7 pagi (7:00) atau jam 4 sore (16:00) tepat
-  bool isScheduledHour = (currentHour == 7 && currentMinute == 0) || 
-                         (currentHour == 16 && currentMinute == 0);
-  
-  // Jika waktu terjadwal dan sekuens belum dimulai, mulai sekuens
-  if (isScheduledHour && !sequenceStarted) {
-    sequenceStarted = true;
-    return true;
-  }
-  
-  // Jika sekuens sudah dimulai, reset flag setelah 1 menit
-  // untuk mencegah sekuens berjalan berulang kali dalam satu jam
-  if (sequenceStarted && ((currentHour == 7 && currentMinute > 0) || 
-                          (currentHour == 16 && currentMinute > 0))) {
-    sequenceStarted = false;
-  }
-  
-  return false;
+  Serial.print("Mode saat ini: ");
+  Serial.println(getModeName(currentMode));
+  Serial.print("Waktu: ");
+  Serial.println(formatDateTime(now));
+  Serial.print("Hari: ");
+  Serial.println(daysOfTheWeek[now.dayOfTheWeek()]);
+  Serial.print("Suhu: ");
+  Serial.print(rtc.getTemperature());
+  Serial.println(" C");
 }
 
 // Fungsi relay yang sudah ada
