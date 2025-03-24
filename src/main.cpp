@@ -31,6 +31,18 @@
 #define API_KEY "AIzaSyASs8IMEdH5s-ne-W7zVQ7nY4Bl9VbQgEE"
 #define DATABASE_URL "https://silagung-default-rtdb.asia-southeast1.firebasedatabase.app"
 
+// Struktur untuk menyimpan konfigurasi jadwal dan durasi
+struct SystemConfig {
+  String morningTime = "07:00";
+  String eveningTime = "16:00";
+  int isibakDuration = 10;
+  int mixingDuration = 5;
+  int supplyDuration = 30;
+};
+
+// Deklarasi variabel konfigurasi sistem
+SystemConfig sysConfig;
+
 // Inisialisasi objek Firebase
 FirebaseData fbdo;
 FirebaseAuth auth;
@@ -174,13 +186,14 @@ void setup() {
   );
   
   // Tambahkan task untuk monitoring Firebase dengan stack size yang lebih besar
-  xTaskCreate(
+  xTaskCreatePinnedToCore(
     TaskFirebaseMonitor,    // Fungsi task
     "FirebaseMonitor",      // Nama task
-    16384,                  // Stack size (lebih besar untuk Firebase)
+    32768,                  // Stack size (diperbesar)
     NULL,                   // Parameter
     1,                      // Prioritas
-    NULL                    // Task handle
+    NULL,                   // Task handle
+    1                       // Core yang digunakan (pin ke core 1)
   );
 }
 
@@ -230,31 +243,27 @@ void TaskAutoSequence(void *pvParameters) {
   (void) pvParameters;
   
   for (;;) {
-    // Hanya jalankan jika dalam mode AUTO
     if (currentMode == MODE_AUTO) {
-      // Cek apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
       if (isScheduledTime()) {
         Serial.println("Waktu terjadwal terdeteksi, memulai sekuens otomatis");
         
-        // Ambil mutex sebelum mengakses relay
         if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-          // Jalankan sekuens
           Serial.println("Auto Sequence: Isi Bak");
           isibak();
           xSemaphoreGive(relayMutex);
-          vTaskDelay(10 * 60 * 1000 / portTICK_PERIOD_MS); // 10 menit untuk isi bak
+          vTaskDelay(sysConfig.isibakDuration * 60 * 1000 / portTICK_PERIOD_MS);
           
           if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
             Serial.println("Auto Sequence: Mixing");
             mixing();
             xSemaphoreGive(relayMutex);
-            vTaskDelay(5 * 60 * 1000 / portTICK_PERIOD_MS); // 5 menit untuk mixing
+            vTaskDelay(sysConfig.mixingDuration * 60 * 1000 / portTICK_PERIOD_MS);
             
             if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
               Serial.println("Auto Sequence: Supply");
               supply();
               xSemaphoreGive(relayMutex);
-              vTaskDelay(30 * 60 * 1000 / portTICK_PERIOD_MS); // 30 menit untuk supply
+              vTaskDelay(sysConfig.supplyDuration * 60 * 1000 / portTICK_PERIOD_MS);
               
               if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
                 Serial.println("Auto Sequence: Off");
@@ -266,8 +275,6 @@ void TaskAutoSequence(void *pvParameters) {
         }
       }
     }
-    
-    // Delay sebelum iterasi berikutnya
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
@@ -375,38 +382,38 @@ void TaskFirebaseMonitor(void *pvParameters) {
   Serial.println("Starting Firebase monitor task");
   
   for (;;) {
-    // Hanya jalankan jika WiFi terhubung dan Firebase siap
     if (WiFi.status() == WL_CONNECTED && signupOK) {
-      // Periksa apakah ada update mode yang pending
-      if (modeUpdatePending) {
+      // Periksa konfigurasi setiap 5 menit
+      static unsigned long lastConfigCheck = 0;
+      if (millis() - lastConfigCheck > 300000) {
         if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
-          String modeStr;
-          switch (pendingModeUpdate) {
-            case MODE_ISIBAK: modeStr = "isibak"; break;
-            case MODE_MIXING: modeStr = "mixing"; break;
-            case MODE_SUPPLY: modeStr = "supply"; break;
-            case MODE_OFF: modeStr = "off"; break;
-            case MODE_AUTO: modeStr = "auto"; break;
-            default: modeStr = "unknown"; break;
+          // Baca konfigurasi jadwal
+          if (Firebase.RTDB.getString(&fbdo, "silagung-controller/config/schedule/morning")) {
+            sysConfig.morningTime = fbdo.stringData();
+          }
+          if (Firebase.RTDB.getString(&fbdo, "silagung-controller/config/schedule/evening")) {
+            sysConfig.eveningTime = fbdo.stringData();
           }
           
-          Serial.print("Updating Firebase mode to: ");
-          Serial.println(modeStr);
-          
-          if (Firebase.RTDB.setString(&fbdo, "silagung-controller/mode/current", modeStr)) {
-            Serial.println("Mode update successful");
-          } else {
-            Serial.print("Mode update failed: ");
-            Serial.println(fbdo.errorReason());
+          // Baca konfigurasi durasi
+          if (Firebase.RTDB.getInt(&fbdo, "silagung-controller/config/duration/isibak")) {
+            sysConfig.isibakDuration = fbdo.intData();
+          }
+          if (Firebase.RTDB.getInt(&fbdo, "silagung-controller/config/duration/mixing")) {
+            sysConfig.mixingDuration = fbdo.intData();
+          }
+          if (Firebase.RTDB.getInt(&fbdo, "silagung-controller/config/duration/supply")) {
+            sysConfig.supplyDuration = fbdo.intData();
           }
           
-          modeUpdatePending = false;
           xSemaphoreGive(firebaseMutex);
         }
+        lastConfigCheck = millis();
       }
       
-      // Cek perintah dari Firebase
+      // Periksa perintah dari Firebase dengan timeout
       if (xSemaphoreTake(firebaseMutex, portMAX_DELAY) == pdTRUE) {
+        Firebase.RTDB.setReadTimeout(&fbdo, 1000);
         if (Firebase.RTDB.getString(&fbdo, "silagung-controller/commands/setMode")) {
           String command = fbdo.stringData();
           
@@ -428,6 +435,7 @@ void TaskFirebaseMonitor(void *pvParameters) {
             }
             
             // Reset perintah
+            vTaskDelay(100 / portTICK_PERIOD_MS);
             Firebase.RTDB.setString(&fbdo, "silagung-controller/commands/setMode", "");
           }
         }
@@ -443,52 +451,37 @@ void TaskFirebaseMonitor(void *pvParameters) {
       }
     }
     
-    // Delay sebelum iterasi berikutnya
+    // Berikan waktu untuk task lain
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
-// Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal (7 pagi atau 4 sore)
+// Fungsi untuk memeriksa apakah sekarang adalah waktu terjadwal
 bool isScheduledTime() {
   static bool sequenceStarted = false;
   static unsigned long lastCheckTime = 0;
   
-  // Periksa lebih sering (setiap 100ms) untuk menangkap waktu dengan lebih tepat
   if (millis() - lastCheckTime < 100) {
     return sequenceStarted;
   }
   
   lastCheckTime = millis();
   DateTime now = rtc.now();
-  int currentHour = now.hour();
-  int currentMinute = now.minute();
-  int currentSecond = now.second();
   
-  // Debug output untuk melihat waktu yang tepat
-  if (currentHour == 7 && currentMinute == 0) {
-    Serial.print("Deteksi waktu terjadwal: ");
-    Serial.print(currentHour);
-    Serial.print(":");
-    Serial.print(currentMinute);
-    Serial.print(":");
-    Serial.println(currentSecond);
-  }
+  char currentTime[6];
+  sprintf(currentTime, "%02d:%02d", now.hour(), now.minute());
+  String timeNow = String(currentTime);
   
-  // Jam 7 pagi (7:00:xx) atau jam 4 sore (16:00:xx) dalam 60 detik pertama
-  bool isScheduledHour = (currentHour == 7 && currentMinute == 0) || 
-                         (currentHour == 16 && currentMinute == 0);
+  bool isScheduledHour = (timeNow == sysConfig.morningTime || timeNow == sysConfig.eveningTime) &&
+                        now.second() < 60;
   
-  // Jika waktu terjadwal dan sekuens belum dimulai, mulai sekuens
   if (isScheduledHour && !sequenceStarted) {
-    Serial.println("Waktu terjadwal terdeteksi, memulai sekuens otomatis");
+    Serial.println("Waktu terjadwal terdeteksi: " + timeNow);
     sequenceStarted = true;
     return true;
   }
   
-  // Jika sekuens sudah dimulai, reset flag setelah 1 menit
-  // untuk mencegah sekuens berjalan berulang kali dalam satu jam
-  if (sequenceStarted && ((currentHour == 7 && currentMinute > 0) || 
-                          (currentHour == 16 && currentMinute > 0))) {
+  if (sequenceStarted && timeNow != sysConfig.morningTime && timeNow != sysConfig.eveningTime) {
     sequenceStarted = false;
   }
   
