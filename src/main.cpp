@@ -5,6 +5,17 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <Firebase_ESP_Client.h>
+#include <ModbusMaster.h>
+#include <HardwareSerial.h>
+
+// Konfigurasi RS485 untuk ESP32-S3 dengan RS485 terintegrasi
+#define RS485_RX 18  // Pin RX untuk RS485
+#define RS485_TX 17  // Pin TX untuk RS485
+#define RS485_DE 16  // Pin DE/RE untuk RS485
+
+// Gunakan HardwareSerial untuk ESP32
+HardwareSerial rs485Serial(1); // Gunakan Serial1
+ModbusMaster node;  // Buat objek Modbus
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -132,7 +143,7 @@ void setup() {
   if (rtc.lostPower()) {
     Serial.println("RTC lost power, setting default time!");
     // Atur waktu default jika RTC kehilangan daya
-    rtc.adjust(DateTime(2024, 1, 1, 0, 0, 0));
+    rtc.adjust(DateTime(2025, 3, 25, 12, 1, 0));
   }
 
   // Tampilkan waktu saat ini
@@ -199,6 +210,96 @@ void setup() {
 
 void loop() {
   // Tidak ada yang perlu dilakukan di sini karena semua operasi ditangani oleh task
+  // Kode untuk kontrol Modbus VFD ATV12
+  static bool vfdEnabled = false;
+  static float vfdFrequency = 0;
+  static unsigned long lastModbusRead = 0;
+  
+  // Inisialisasi Modbus jika belum diinisialisasi
+  static bool modbusInitialized = false;
+  if (!modbusInitialized) {
+    // Inisialisasi RS485 dengan HardwareSerial
+    Serial1.begin(9600, SERIAL_8N1, 18, 17); // RX=18, TX=17
+    
+    pinMode(16, OUTPUT); // DE/RE pin
+    digitalWrite(16, LOW);
+    
+    node.begin(1, Serial1);  // Slave ID = 1
+    node.preTransmission([]() {
+      digitalWrite(16, HIGH);
+      delay(2);
+    });
+    node.postTransmission([]() {
+      digitalWrite(16, LOW);
+    });
+    
+    modbusInitialized = true;
+    Serial.println("Modbus untuk ATV12 VFD diinisialisasi");
+  }
+  
+  // Cek apakah mode saat ini memerlukan VFD aktif
+  bool shouldVfdBeActive = (currentMode == MODE_MIXING || 
+                           currentMode == MODE_SUPPLY ||
+                           currentMode == MODE_ISIBAK)
+                           ;
+  // Cek jika mode OFF, atur frekuensi VFD menjadi 0
+  if (currentMode == MODE_OFF) {
+    vfdFrequency = 0.0;
+    Serial.println("Mode OFF: Mengatur frekuensi VFD menjadi 0 Hz");
+  } else {
+    // Jika dalam mode MIXING, SUPPLY, ISIBAK, atau AUTO, gunakan frekuensi 48 Hz
+    vfdFrequency = 48.0;
+    Serial.println("Mode aktif: Mengatur frekuensi VFD menjadi 48 Hz");
+  }
+  // Aktifkan atau nonaktifkan VFD sesuai mode
+  if (shouldVfdBeActive && !vfdEnabled) {
+    // Aktifkan VFD dengan frekuensi yang ditentukan
+    Serial.println("Mengaktifkan VFD pada " + String(vfdFrequency) + " Hz");
+    
+    // Start sequence dengan arah forward
+    uint8_t result;
+    result = node.writeSingleRegister(8501, 6);  // Pre-charge
+    delay(100);
+    result = node.writeSingleRegister(8501, 7);  // Start
+    delay(100);
+    
+    // Set frekuensi (48Hz = 480 dalam format VFD)
+    uint16_t freqValue = (uint16_t)(vfdFrequency * 10);
+    result = node.writeSingleRegister(8502, freqValue);
+    delay(100);
+    
+    result = node.writeSingleRegister(8501, 15);  // Forward run
+    
+    if (result == node.ku8MBSuccess) {
+      Serial.println("VFD berhasil diaktifkan pada " + String(vfdFrequency) + " Hz");
+      vfdEnabled = true;
+    } else {
+      Serial.println("Gagal mengaktifkan VFD!");
+    }
+  } else if (!shouldVfdBeActive && vfdEnabled) {
+    // Nonaktifkan VFD
+    Serial.println("Menonaktifkan VFD");
+    uint8_t result = node.writeSingleRegister(8501, 0);
+    if (result == node.ku8MBSuccess) {
+      Serial.println("VFD berhasil dinonaktifkan");
+      vfdEnabled = false;
+    } else {
+      Serial.println("Gagal menonaktifkan VFD!");
+    }
+  }
+  
+  // Baca frekuensi aktual setiap 5 detik
+  if (vfdEnabled && millis() - lastModbusRead >= 5000) {
+    uint8_t result = node.readHoldingRegisters(8503, 1);
+    if (result == node.ku8MBSuccess) {
+      int16_t freq = node.getResponseBuffer(0);
+      float actualFreq = freq / 10.0;
+      Serial.print("Frekuensi VFD aktual: ");
+      Serial.print(actualFreq);
+      Serial.println(" Hz");
+    }
+    lastModbusRead = millis();
+  }
   vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
 
@@ -618,9 +719,9 @@ void mixing(){
 }
 
 void supply(){
-  digitalWrite(RELAY1, LOW);
+  digitalWrite(RELAY1, HIGH);
   digitalWrite(RELAY2, LOW);
-  digitalWrite(RELAY3, HIGH);
+  digitalWrite(RELAY3, LOW);
   digitalWrite(RELAY4, LOW);
   digitalWrite(RELAY5, HIGH);
   digitalWrite(RELAY6, LOW);
